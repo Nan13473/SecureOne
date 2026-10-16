@@ -305,14 +305,23 @@ npm run build
 2. Upload a clear identity-document image, review the locally extracted name,
 	then register the holder identity. With a configured deployment, MetaMask
 	signs an on-chain registration containing only the document fingerprint.
-3. Use the issuer workspace to reach the approval threshold and mint.
-4. Return to the holder workspace and confirm the credential.
-5. Ask for one field from the verifier workspace.
-6. Open **Present**, connect the holder MetaMask account, and sign the QR.
-7. Import the QR in **Verify** to inspect the validation result.
-8. Generate a fresh challenge QR in **Verify**. The holder scans it in
+3. In the issuer workspace, enter the student wallet and click **Check DID**.
+   The screen reports only `Registered DID` or `No DID found`.
+4. Choose the institution record or upload one JSON/CSV certificate record.
+   Uploads must include `wallet_address`, which must match the checked wallet,
+   plus `program`, `name`, `credential`, `institution`, and `issued`.
+5. Build the credential package. The browser creates field commitments, a
+   Merkle root, AES-GCM ciphertext, and a ciphertext hash. The package uses a
+   clearly marked placeholder CID unless the configured upload endpoint returns
+   a real IPFS CID.
+6. Use the issuer workspace to reach the approval threshold and mint.
+7. Return to the holder workspace and confirm the credential.
+8. Ask for one field from the verifier workspace.
+9. Open **Present**, connect the holder MetaMask account, and sign the QR.
+10. Import the QR in **Verify** to inspect the validation result.
+11. Generate a fresh challenge QR in **Verify**. The holder scans it in
 	**Present**, signs it with the matching wallet, and returns the response QR.
-9. Import the newly signed response QR before relying on wallet control.
+12. Import the newly signed response QR before relying on wallet control.
 
 The QR requires the holder wallet because it contains a cryptographic signature.
 The verifier first checks the official contract, chain, Confirmed status,
@@ -345,18 +354,55 @@ Set these values when using on-chain identity registration and issuer discovery:
 ```dotenv
 VITE_OFFICIAL_CHAIN_ID=11155111
 VITE_VERIBIND_CONTRACT_ADDRESS=0xYourDeployedContract
+VITE_VERIBIND_DEPLOYMENT_BLOCK=0
 VITE_DEMO_RECIPIENT_ADDRESS=0xCredentialRecipient
+VITE_PINATA_API_URL=
+VITE_PINATA_JWT=
 ```
+
+The repository also includes `frontend/.env.production` with the current
+Sepolia chain and contract settings. When Vercel's project root is set to
+`frontend`, its normal Vite production build loads that file automatically, so
+these public `VITE_*` values do not need to be entered manually in Vercel.
+Create a new deployment after changing the file. Update the contract address
+there whenever a new deployment is made.
+
+Hardhat Sepolia deployment uses these root `.env` values:
+
+```dotenv
+SEPOLIA_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/your-alchemy-key
+DEPLOYER_PRIVATE_KEY=0xyour-deployer-private-key
+```
+
+After funding the deployer wallet with Sepolia ETH, deploy with:
+
+```powershell
+npm run deploy:sepolia
+```
+
+The deployment uses a three-issuer approval threshold on Sepolia. Never commit
+`.env`, RPC API keys, or private keys. If an RPC/API key was shared publicly,
+rotate it in the provider dashboard.
 
 Deploy the current `VeriBindCredential` contract before using the issuer
 recipient list. The issuer reads the contract's registered-holder index, so an
 older deployment without `registeredHolderCount` and `registeredHolderAt`
 must be redeployed. The chain stores the public wallet address, document
-fingerprint, Merkle root, and photo commitment; names, raw photos, and other
-profile fields are not written on-chain. Issuance from the current frontend
-remains demo-local and does not submit contract transactions. Redeploy the
-current contract before using a live environment because the `photoHash` field
-and getter are part of the current ABI.
+fingerprint, Merkle root, issuance digest, encrypted-document CID, ciphertext
+hash, and photo commitment; names, raw photos, and other profile fields are
+not written on-chain. The current issuer flow submits the existing
+`proposeIssuance`, `approveIssuance`, and `finalizeIssuance` transactions when
+the contract is configured. A missing Pinata configuration intentionally
+produces a `ipfs://placeholder/...` CID and must not be treated as a production
+upload. Do not expose a production Pinata secret in a `VITE_*` variable; use a
+server-side upload proxy for production. Redeploy the current contract before
+using a live environment because the `photoHash` and issuance getters are part
+of the current ABI.
+
+`VITE_VERIBIND_DEPLOYMENT_BLOCK` is optional and should be set to the block
+where the configured contract was deployed. If it is left at `0`, the issuer
+approval lookup scans only the latest 10,000 blocks to stay within public RPC
+log-query limits.
 
 Deployment-only values such as `SEPOLIA_RPC_URL`, `DEPLOYER_PRIVATE_KEY`, and
 `PINATA_JWT` belong in `.env` and must never be committed.

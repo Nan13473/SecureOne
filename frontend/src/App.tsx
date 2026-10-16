@@ -5,11 +5,12 @@ import jsQR from "jsqr";
 import { buildMerkleProof, buildMerkleRoot, hashField, verifyMerkleProof } from "./lib/merkle";
 import { extractDocumentName, fingerprintDocumentText } from "./lib/identity";
 import { checkPresentation, checkVerificationChallenge, randomNonce, signPresentation, signVerificationChallenge, type VerificationChallenge, type VeribindPresentation } from "./lib/presentation";
+import { buildCredentialPackage, canBuildCredential, findDuplicateCredential, parseCertificateUpload, type CertificateRecord, type CredentialPackage, validateCertificateRecord } from "./lib/issuance";
 
 type View = "identity" | "institution" | "holder" | "presentation" | "verify" | "debug";
 type Status = "Pending" | "Confirmed" | "Disputed";
 type Role = "holder" | "issuer" | "verifier";
-type DemoHolder = { address: string; did: string; name: string; credential: string; institution: string; docHash: string; photoHash?: string };
+type DemoHolder = { address: string; did: string; name: string; credential: string; institution: string; docHash: string; photoHash?: string; program?: string; issued?: string };
 type ConsentStatus = "Pending" | "Approved" | "Rejected" | "Expired" | "Completed";
 type ConsentRequest = {
   type: "veribind-verification-request";
@@ -134,6 +135,8 @@ function App() {
   const [chainIssuance, setChainIssuance] = useState<{ id: string; approvals: number; threshold: number; finalized: boolean; approvedByMe: boolean; merkleRoot: string; expiresAt: number } | null>(null);
   const [issuanceRefreshVersion, setIssuanceRefreshVersion] = useState(0);
   const [issuanceBusy, setIssuanceBusy] = useState(false);
+  const [preparedPackage, setPreparedPackage] = useState<CredentialPackage | null>(null);
+  const [lastTransactionHash, setLastTransactionHash] = useState("");
   const [field, setField] = useState("Credential");
   const [proofRequested, setProofRequested] = useState(false);
   const [proofRequestRecipient, setProofRequestRecipient] = useState("");
@@ -262,7 +265,16 @@ function App() {
         const network = await provider.getNetwork();
         if (Number(network.chainId) !== presentationChainId) throw new Error(`Switch MetaMask to chain ${presentationChainId} to load issuance approvals.`);
         const contract = new Contract(contractAddress, identityRegistryAbi, provider);
-        const events = await contract.queryFilter(contract.filters.IssuanceProposed(null, selectedHolderAddress));
+        const latestBlock = await provider.getBlockNumber();
+        const configuredDeploymentBlock = Number(import.meta.env.VITE_VERIBIND_DEPLOYMENT_BLOCK || 0);
+        const fromBlock = configuredDeploymentBlock > 0
+          ? configuredDeploymentBlock
+          : Math.max(0, latestBlock - 10_000);
+        const events = await contract.queryFilter(
+          contract.filters.IssuanceProposed(null, selectedHolderAddress),
+          fromBlock,
+          latestBlock,
+        );
         const threshold = Number(await contract.APPROVAL_THRESHOLD());
         let latest = null;
         for (const event of [...events].reverse()) {
@@ -317,19 +329,26 @@ function App() {
 
       let transaction;
       if (action === "propose") {
-        if (!registered || !isRealWalletAddress(selectedHolderAddress)) throw new Error("The selected holder must register on-chain before issuance.");
-        const allFields = credentialFields(selectedHolder);
-        const leaves = await Promise.all(allFields.map(([name, value]) => hashField(1, name.toLowerCase(), value)));
-        const merkleRoot = `0x${await buildMerkleRoot(leaves)}`;
-        const photoHash = photoHashForHolder(selectedHolder);
-        const issuanceDigest = keccak256(toUtf8Bytes(JSON.stringify({ holder: selectedHolderAddress.toLowerCase(), merkleRoot, fields: allFields })));
-        transaction = await contract.proposeIssuance(selectedHolderAddress, merkleRoot, photoHash, "", ZeroHash, issuanceDigest, 1, 0);
+        if (!preparedPackage || preparedPackage.walletAddress.toLowerCase() !== selectedHolderAddress.toLowerCase()) {
+          throw new Error("Build and review the credential package before proposing issuance.");
+        }
+        transaction = await contract.proposeIssuance(
+          preparedPackage.walletAddress,
+          preparedPackage.merkleRoot,
+          preparedPackage.photoHash,
+          preparedPackage.cid,
+          preparedPackage.ciphertextHash,
+          preparedPackage.issuanceDigest,
+          preparedPackage.schemaVersion,
+          preparedPackage.expiresAt,
+        );
       } else {
         if (!chainIssuance) throw new Error("There is no pending issuance for this holder.");
         transaction = action === "approve"
           ? await contract.approveIssuance(chainIssuance.id)
           : await contract.finalizeIssuance(chainIssuance.id);
       }
+      setLastTransactionHash(transaction.hash);
       await transaction.wait();
       setIssuanceRefreshVersion((version) => version + 1);
       setCredentialRefreshVersion((version) => version + 1);
@@ -378,6 +397,44 @@ function App() {
     setProofRequested(false);
     setProofSent(false);
     setProofDenied(false);
+    setPreparedPackage(null);
+  };
+
+  const checkStudentDid = async (address: string, demoMode = false): Promise<{ registered: boolean; source: "on-chain" | "demo-local" }> => {
+    if (!isRealWalletAddress(address)) throw new Error("Enter a valid Ethereum wallet address.");
+    const contractAddress = import.meta.env.VITE_VERIBIND_CONTRACT_ADDRESS;
+    if (demoMode) {
+      return { registered: demoHolders.some((candidate) => candidate.address.toLowerCase() === address.toLowerCase()) || registeredDids.some((candidate) => candidate.toLowerCase() === address.toLowerCase()), source: "demo-local" };
+    }
+    if (!window.ethereum || !contractAddress || !isRealWalletAddress(contractAddress) || /^0x0{40}$/i.test(contractAddress)) {
+      return { registered: registeredDids.some((candidate) => candidate.toLowerCase() === address.toLowerCase()), source: "demo-local" };
+    }
+    const provider = new BrowserProvider(window.ethereum as never);
+    const network = await provider.getNetwork();
+    if (Number(network.chainId) !== presentationChainId) throw new Error(`Switch MetaMask to chain ${presentationChainId} to check the DID.`);
+    const contract = new Contract(contractAddress, identityRegistryAbi, provider);
+    const identityHash = String(await contract.registeredIdentity(address));
+    return { registered: !/^0x0{64}$/i.test(identityHash), source: "on-chain" };
+  };
+
+  const checkProgramDuplicate = async (address: string, program: string): Promise<{ duplicate: boolean; source: "on-chain" | "demo-local"; tokenId?: string }> => {
+    const contractAddress = import.meta.env.VITE_VERIBIND_CONTRACT_ADDRESS;
+    if (!window.ethereum || !contractAddress || !isRealWalletAddress(contractAddress) || /^0x0{40}$/i.test(contractAddress)) {
+      return { duplicate: false, source: "demo-local" };
+    }
+    const provider = new BrowserProvider(window.ethereum as never);
+    const network = await provider.getNetwork();
+    if (Number(network.chainId) !== presentationChainId) throw new Error(`Switch MetaMask to chain ${presentationChainId} to check duplicate credentials.`);
+    const contract = new Contract(contractAddress, credentialReadAbi, provider);
+    const count = Number(await contract.holderCredentialCount(address));
+    const credentials: { tokenId: string; issuanceDigest: string }[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const tokenId = String(await contract.holderCredentialAt(address, index));
+      const digest = String(await contract.credentialIssuanceDigest(tokenId));
+      credentials.push({ tokenId, issuanceDigest: digest });
+    }
+    const duplicateTokenId = findDuplicateCredential(address, program, credentials);
+    return duplicateTokenId ? { duplicate: true, source: "on-chain", tokenId: duplicateTokenId } : { duplicate: false, source: "on-chain" };
   };
 
   if (!session)
@@ -532,21 +589,22 @@ function App() {
         )}
         {view === "institution" && (
           <Institution
-            registered={registered}
-            holder={selectedHolder}
-            recipients={issuerRecipients}
-            selectedHolderAddress={selectedHolderAddress}
             chainBacked={isRealWalletAddress(session.address) && isRealWalletAddress(presentationContract) && !/^0x0{40}$/i.test(presentationContract)}
             chainCredential={chainCredential}
             status={status}
             chainIssuance={chainIssuance}
             issuanceBusy={issuanceBusy}
             onIssuerAction={submitIssuanceAction}
-            onSelectHolder={selectHolder}
-            approved={approved}
-            setApproved={setApproved}
             minted={minted}
             setMinted={setMinted}
+            onCheckDid={checkStudentDid}
+            onCheckDuplicate={checkProgramDuplicate}
+            onPrepare={(packageData, address) => {
+              setPreparedPackage(packageData);
+              setSelectedHolderAddress(address);
+              setIdentityProfiles((current) => ({ ...current, [address]: { ...profileForAddress(current, address), address, name: packageData.fields.find(([name]) => name === "name")?.[1] ?? "Credential holder", program: packageData.program, credential: packageData.fields.find(([name]) => name === "credential")?.[1] ?? packageData.program, institution: packageData.fields.find(([name]) => name === "institution")?.[1] ?? "Institution", issued: packageData.fields.find(([name]) => name === "issued")?.[1], photoHash: packageData.fields.some(([name]) => name === "photo hash") ? packageData.photoHash : undefined, docHash: "" } }));
+            }}
+            transactionHash={lastTransactionHash}
           />
         )}
         {view === "holder" && (
@@ -1028,94 +1086,178 @@ function IdentityFields({ holder }: { holder: DemoHolder }) {
 }
 
 function Institution({
-  registered,
-  holder,
-  recipients,
-  selectedHolderAddress,
-  status,
   chainBacked,
   chainCredential,
   chainIssuance,
   issuanceBusy,
   onIssuerAction,
-  onSelectHolder,
-  approved,
-  setApproved,
+  status,
   minted,
   setMinted,
+  onCheckDid,
+  onCheckDuplicate,
+  onPrepare,
+  transactionHash,
 }: {
-  registered: boolean;
-  holder: DemoHolder;
-  recipients: DemoHolder[];
-  selectedHolderAddress: string;
-  status: Status;
   chainBacked: boolean;
   chainCredential: { tokenId: string; merkleRoot: string; issuanceDigest: string; issuedAt: number; expiresAt: number } | null;
   chainIssuance: { id: string; approvals: number; threshold: number; finalized: boolean; approvedByMe: boolean; merkleRoot: string; expiresAt: number } | null;
   issuanceBusy: boolean;
   onIssuerAction: (action: "propose" | "approve" | "finalize") => Promise<void>;
-  onSelectHolder: (value: string) => void;
-  approved: number;
-  setApproved: (value: number) => void;
+  status: Status;
   minted: boolean;
   setMinted: (value: boolean) => void;
+  onCheckDid: (address: string, demoMode?: boolean) => Promise<{ registered: boolean; source: "on-chain" | "demo-local" }>;
+  onCheckDuplicate: (address: string, program: string) => Promise<{ duplicate: boolean; source: "on-chain" | "demo-local"; tokenId?: string }>;
+  onPrepare: (packageData: CredentialPackage, address: string) => void;
+  transactionHash: string;
 }) {
+  const [studentAddress, setStudentAddress] = useState("");
+  const [didResult, setDidResult] = useState<{ registered: boolean; source: "on-chain" | "demo-local" } | null>(null);
+  const [didError, setDidError] = useState("");
+  const [dataSource, setDataSource] = useState<"institution" | "upload">("institution");
+  const [demoEnabled, setDemoEnabled] = useState(false);
+  const [record, setRecord] = useState<Partial<CertificateRecord>>({});
+  const [uploadName, setUploadName] = useState("");
+  const [dataError, setDataError] = useState("");
+  const [duplicate, setDuplicate] = useState<{ tokenId?: string; source: "on-chain" | "demo-local" } | null>(null);
+  const [packageData, setPackageData] = useState<CredentialPackage | null>(null);
+  const [building, setBuilding] = useState(false);
+  const [buildError, setBuildError] = useState("");
+
+  const didPassed = didResult?.registered === true;
+  const dataPassed = Boolean(packageData);
+  const effectiveRecord = {
+    wallet_address: studentAddress,
+    ...(demoEnabled ? {
+    wallet_address: studentAddress,
+    program: "Bachelor of Computer Science",
+    name: "Ananya Rao",
+    credential: "Bachelor of Computer Science",
+    institution: "Northstar Institute of Technology",
+    issued: "14 September 2026",
+    } : record),
+  };
+  const dataReady = (() => {
+    try {
+      return canBuildCredential(effectiveRecord as Record<string, unknown>, studentAddress, didPassed);
+    } catch {
+      return false;
+    }
+  })();
+
+  const checkDid = async () => {
+    setDidError("");
+    setDidResult(null);
+    setPackageData(null);
+    if (!isRealWalletAddress(studentAddress)) {
+      setDidError("Enter a valid Ethereum wallet address.");
+      return;
+    }
+    try {
+      const result = await onCheckDid(studentAddress, demoEnabled);
+      setDidResult(result);
+      if (!result.registered) setDidError("No DID found");
+    } catch (reason) {
+      setDidError(reason instanceof Error ? reason.message : "Unable to check DID.");
+    }
+  };
+
+  const loadUpload = async (file: File) => {
+    setDataError("");
+    setPackageData(null);
+    setUploadName(file.name);
+    try {
+      const parsed = parseCertificateUpload(await file.text(), file.name, studentAddress);
+      setRecord(parsed);
+    } catch (reason) {
+      setDataError(reason instanceof Error ? reason.message : "Unable to validate upload.");
+    }
+  };
+
+  const build = async () => {
+    setBuildError("");
+    setDuplicate(null);
+    if (!didPassed) return setBuildError("Check DID and confirm Registered DID before building.");
+    if (!isRealWalletAddress(studentAddress)) return setBuildError("Enter a valid Ethereum wallet address.");
+    try {
+      const validRecord = validateCertificateRecord(effectiveRecord as Record<string, unknown>, studentAddress);
+      const duplicateResult = await onCheckDuplicate(studentAddress, validRecord.program);
+      if (duplicateResult.duplicate) {
+        setDuplicate({ tokenId: duplicateResult.tokenId, source: duplicateResult.source });
+        setBuildError(`A credential already exists for this address and program${duplicateResult.tokenId ? ` (token #${duplicateResult.tokenId})` : ""}. Issuance is blocked.`);
+        return;
+      }
+      setBuilding(true);
+      const built = await buildCredentialPackage(validRecord, {
+        apiUrl: import.meta.env.VITE_PINATA_API_URL,
+        jwt: import.meta.env.VITE_PINATA_JWT,
+      });
+      setPackageData(built);
+      onPrepare(built, studentAddress);
+    } catch (reason) {
+      setBuildError(reason instanceof Error ? reason.message : "Credential package build failed.");
+    } finally {
+      setBuilding(false);
+    }
+  };
+
+  const updateRecord = (field: keyof CertificateRecord, value: string) => {
+    setRecord((current) => ({ ...current, [field]: value }));
+    setPackageData(null);
+    setDataError("");
+  };
+
   return (
     <div className="workspace">
-      <Steps active={chainBacked ? chainCredential ? status === "Pending" ? 3 : 4 : chainIssuance ? 2 : registered ? 1 : 0 : minted ? 3 : registered ? (approved >= 3 ? 2 : 1) : 0} />
+      <Steps active={chainCredential ? 3 : chainIssuance ? 2 : packageData ? 1 : didPassed ? 0 : 0} />
       <div className="content-grid">
         <section className="primary-column">
           <div className="section-heading">
-            <div>
-              <span className="eyebrow">
-                PHASE 02 / CERTIFICATE PREPARATION
-              </span>
-              <h2>Prepare the credential</h2>
+            <div><span className="eyebrow">PHASE 02 / CERTIFICATE PREPARATION</span><h2>Prepare the credential</h2></div>
+            <span className="state-tag">{chainBacked ? "ON-CHAIN" : "DEMO-LOCAL"}</span>
+          </div>
+          <div className="issuance-card">
+            <div className="section-heading"><div><span className="eyebrow">STEP 01</span><h3>Check student identity</h3></div><ProvenanceBadge label={didResult?.source ?? (chainBacked ? "on-chain" : "demo-local")} /></div>
+            <div className="address-row">
+              <input value={studentAddress} onChange={(event) => { setStudentAddress(event.target.value); setDidResult(null); setPackageData(null); }} placeholder="0x student wallet address" />
+              <button className="secondary-action" onClick={() => void checkDid()}>Check DID</button>
             </div>
-            <span className="state-tag">
-              {registered ? "IDENTITY READY" : "WAITING"}
-            </span>
+            {didResult && <p className={didResult.registered ? "success-copy" : "presentation-error"}>{didResult.registered ? "Registered DID" : "No DID found"}{didResult.source === "demo-local" ? " · demo-local" : ""}</p>}
+            {didError && <p className="presentation-error">{didError}</p>}
           </div>
-          <div className="identity-gate">
-            <strong>
-              {registered
-                ? `${holder.did} is registered`
-                : "Waiting for recipient identity"}
-            </strong>
-            <span>
-              {registered
-                ? "You can prepare and approve this issuance."
-                : "The recipient must complete Identity before you can issue."}
-            </span>
-          </div>
-          <label className="field-label did-picker">
-            DID to issue
-            <select value={selectedHolderAddress} onChange={(event) => onSelectHolder(event.target.value)}>
-              {recipients.map((candidate) => (
-                <option key={candidate.address} value={candidate.address}>{candidate.did} · {candidate.name} · {shortAddress(candidate.address)}</option>
-              ))}
-            </select>
-          </label>
-          <div className="issuance-card simple-package">
-            <div className="package-line">
-              <div className="file-icon">▧</div>
-              <div>
-                <strong>{holder.name.toLowerCase().replace(/\s+/g, "-")}-degree.json</strong>
-                <span>4 fields · AES-GCM encrypted · IPFS pinned</span>
+          <div className="issuance-card">
+            <div className="section-heading"><div><span className="eyebrow">STEP 02</span><h3>Load certificate data</h3></div><ProvenanceBadge label={packageData ? "demo-local" : "not loaded"} /></div>
+            <div className="source-toggle">
+              <label><input type="radio" checked={dataSource === "institution"} onChange={() => { setDataSource("institution"); setPackageData(null); }} /> Use institution record</label>
+              <label><input type="radio" checked={dataSource === "upload"} onChange={() => { setDataSource("upload"); setPackageData(null); }} /> Upload personal data</label>
+            </div>
+            <label className="field-label"><input type="checkbox" checked={demoEnabled} onChange={(event) => { setDemoEnabled(event.target.checked); setPackageData(null); }} /> Enable demo-local sample data</label>
+            {dataSource === "upload" && !demoEnabled ? (
+              <label className="field-label">JSON or CSV file<input type="file" accept=".json,.csv,application/json,text/csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) void loadUpload(file); }} /></label>
+            ) : (
+              <div className="data-form">
+                {(["program", "name", "credential", "institution", "issued"] as const).map((field) => <label className="field-label" key={field}>{field}<input value={String(effectiveRecord[field] ?? "")} onChange={(event) => updateRecord(field, event.target.value)} disabled={demoEnabled} /></label>)}
+                <label className="field-label">Optional photo commitment<input value={String(effectiveRecord.photo ?? "")} onChange={(event) => updateRecord("photo", event.target.value)} disabled={demoEnabled} /></label>
               </div>
-              <code>bafybeig...k2mx</code>
-            </div>
-            <div className="root-line">
-              <span>Certificate Merkle root</span>
-              <code>{chainIssuance?.merkleRoot ?? chainCredential?.merkleRoot ?? (chainBacked ? "Calculated when proposed" : "0x6a1f2e8c...d440 (demo)")}</code>
-              <span className="separate">≠ docHash</span>
-            </div>
+            )}
+            {uploadName && <small>Loaded: {uploadName}</small>}
+            {dataReady && <div className="request-details"><div><span>Preview</span><strong>{String(effectiveRecord.name)} · {String(effectiveRecord.program)}</strong></div><div><span>Wallet</span><strong>{String(effectiveRecord.wallet_address)}</strong></div><div><span>Institution</span><strong>{String(effectiveRecord.institution)}</strong></div></div>}
+            {dataError && <p className="presentation-error">{dataError}</p>}
+            <p className="helper">Required fields: wallet_address, program, name, credential, institution, issued. Personal fields stay off-chain.</p>
+          </div>
+          <div className="issuance-card">
+            <div className="section-heading"><div><span className="eyebrow">STEP 03</span><h3>Build credential</h3></div><ProvenanceBadge label={packageData ? "demo-local" : "waiting"} /></div>
+            {packageData && <div className="package-line"><div><strong>Credential package ready</strong><span>{packageData.fields.length} fields · AES-GCM encrypted</span></div><code>{packageData.cidIsPlaceholder ? "CID placeholder" : packageData.cid}</code></div>}
+            {duplicate && <p className="presentation-error">Duplicate blocked{duplicate.tokenId ? ` · existing token #${duplicate.tokenId}` : ""} · {duplicate.source}</p>}
+            {buildError && <p className="presentation-error">{buildError}</p>}
+            <button className="primary-action" onClick={() => void build()} disabled={!didPassed || !dataReady || building || Boolean(packageData)}>{building ? "Building package..." : packageData ? "Credential package built" : "Build credential"}<span>→</span></button>
           </div>
         </section>
         <aside className="side-panel">
-          <PanelTitle title="Issuer approval" eyebrow={chainBacked ? `${chainIssuance?.threshold ?? 2} ISSUERS REQUIRED` : "3 OF 5 REQUIRED"} />
+          <PanelTitle title="Issuer approval" eyebrow={chainBacked ? `${chainIssuance?.threshold ?? 2} ISSUERS REQUIRED` : "DEMO-LOCAL"} />
           <div className="approval-bar">
-            <span style={{ width: `${chainBacked && chainIssuance ? Math.min(100, chainIssuance.approvals / chainIssuance.threshold * 100) : approved * 20}%` }} />
+            <span style={{ width: `${chainIssuance ? Math.min(100, chainIssuance.approvals / chainIssuance.threshold * 100) : 0}%` }} />
           </div>
           {chainBacked ? (
             <div className="request-details">
@@ -1124,22 +1266,11 @@ function Institution({
               <div><span>Expiry</span><strong>{chainIssuance?.expiresAt ? new Date(chainIssuance.expiresAt * 1000).toLocaleDateString() : "No expiry"}</strong></div>
             </div>
           ) : (
-          <div className="issuer-row">
-            { ["NS", "VK", "PM", "JO", "AL"].map((initials, index) => (
-              <button
-                key={initials}
-                className={`issuer ${index < approved ? "signed" : ""}`}
-                onClick={() => setApproved(Math.max(approved, index + 1))}
-              >
-                <span>{index < approved ? "✓" : initials}</span>
-                <small>{index < approved ? "signed" : "awaiting"}</small>
-              </button>
-            ))}
-          </div>
+            <p className="helper">Demo-local approval state is disabled for production issuance. Configure the contract to collect real issuer approvals.</p>
           )}
           {chainBacked ? (
             chainCredential ? <p className="state-tag">NFT #{chainCredential.tokenId} exists on-chain · {status}</p> : !chainIssuance ? (
-              <button className="primary-action" onClick={() => void onIssuerAction("propose").catch(() => undefined)} disabled={!registered || issuanceBusy}>
+              <button className="primary-action" onClick={() => void onIssuerAction("propose").catch(() => undefined)} disabled={!packageData || issuanceBusy}>
                 {issuanceBusy ? "Waiting for MetaMask..." : "Propose issuance on-chain"}<span>→</span>
               </button>
             ) : !chainIssuance.approvedByMe ? (
@@ -1152,19 +1283,23 @@ function Institution({
               </button>
             ) : <p className="identity-gate"><strong>Waiting for second issuer</strong><span>Switch MetaMask to the other authorized issuer account to approve.</span></p>
           ) : (
-            <button className="secondary-action" onClick={() => setMinted(true)} disabled={!registered || approved < 3 || minted}>
-              {minted ? "Pending NFT minted" : "Finalize & mint Pending NFT"}<span>→</span>
-            </button>
+            <p className="helper">No on-chain transaction is available in demo-local mode.</p>
           )}
+          {transactionHash && <p className="success-copy">on-chain · tx {shortAddress(transactionHash)}</p>}
+          {packageData?.cidIsPlaceholder && <p className="helper">IPFS CID is a clearly marked placeholder because Pinata is not configured.</p>}
           <p className="helper">
             {chainBacked
               ? "Issuance proposals, issuer approvals, and final minting are on-chain MetaMask transactions. A separate holder transaction confirms the credential."
-              : "Minting creates Pending status. It is not trusted until the holder confirms."}
+              : "Issuer data is demo-local until an official contract is configured. Issuers are trusted to supply accurate data."}
           </p>
         </aside>
       </div>
     </div>
   );
+}
+
+function ProvenanceBadge({ label }: { label: string }) {
+  return <span className="verified-badge">{label}</span>;
 }
 
 function Holder({
@@ -1348,7 +1483,8 @@ const credentialReadAbi = [
 async function makePresentation(provider: BrowserProvider, recipientAddress: string, holder: DemoHolder, field: string, chainCredential: { tokenId: string; merkleRoot: string; issuanceDigest: string; issuedAt: number; expiresAt: number } | null, challenge?: VerificationChallenge): Promise<VeribindPresentation> {
   const allFields = credentialFields(holder);
   const leaves = await Promise.all(allFields.map(([name, value]) => hashField(1, name.toLowerCase(), value)));
-  const fieldIndex = allFields.findIndex(([name]) => name === field);
+  const fieldIndex = allFields.findIndex(([name]) => name.toLowerCase() === field.toLowerCase());
+  if (fieldIndex < 0) throw new Error(`Unsupported presentation field: ${field}`);
   const calculatedMerkleRoot = await buildMerkleRoot(leaves);
   if (chainCredential && calculatedMerkleRoot.toLowerCase() !== chainCredential.merkleRoot.toLowerCase()) {
     throw new Error("The local holder profile does not match the credential data committed on-chain.");
@@ -1376,11 +1512,12 @@ async function makePresentation(provider: BrowserProvider, recipientAddress: str
 
 function credentialFields(holder: DemoHolder): [string, string][] {
   return [
-    ["Name", holder.name],
-    ["Credential", holder.credential],
-    ["Institution", holder.institution],
-    ["Issued", "14 September 2026"],
-    ["Photo hash", photoHashForHolder(holder)],
+    ["name", holder.name],
+    ["program", holder.program ?? holder.credential],
+    ["credential", holder.credential],
+    ["institution", holder.institution],
+    ["issued", holder.issued ?? "14 September 2026"],
+    ...(holder.photoHash ? [["photo hash", holder.photoHash] as [string, string]] : []),
   ];
 }
 

@@ -7,12 +7,14 @@
     "test": "hardhat test",
     "node": "hardhat node",
     "deploy:local": "hardhat run scripts/deploy.ts --network localhost",
+    "deploy:sepolia": "hardhat run scripts/deploy.ts --network sepolia",
     "frontend": "npm --prefix frontend run dev",
     "build": "npm --prefix frontend run build"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-toolbox": "^5.0.0",
     "@openzeppelin/contracts": "5.0.2",
+    "dotenv": "^16.4.5",
     "hardhat": "^2.22.10",
     "ts-node": "^10.9.2",
     "typescript": "^5.6.3"
