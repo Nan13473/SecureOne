@@ -272,16 +272,18 @@ function App() {
           ? configuredDeploymentBlock
           : latestBlock - maxLogRange;
         const fromBlock = Math.max(0, Math.max(configuredFromBlock, latestBlock - maxLogRange));
-        const events = await contract.queryFilter(
-          contract.filters.IssuanceProposed(null, selectedHolderAddress),
-          fromBlock,
-          latestBlock,
-        );
+        const events = [];
+        const filter = contract.filters.IssuanceProposed(null, selectedHolderAddress);
+        for (let chunkStart = fromBlock; chunkStart <= latestBlock; chunkStart += 500) {
+          const chunkEnd = Math.min(latestBlock, chunkStart + 499);
+          events.push(...await contract.queryFilter(filter, chunkStart, chunkEnd));
+        }
         const threshold = Number(await contract.APPROVAL_THRESHOLD());
         let latest = null;
         for (const event of [...events].reverse()) {
           if (!("args" in event)) continue;
-          const issuanceId = String(event.args.issuanceId ?? event.args[0]);
+          const args = event.args as readonly unknown[];
+          const issuanceId = String(args[0]);
           const issuance = await contract.issuances(issuanceId);
           const finalized = Boolean(issuance.finalized ?? issuance[9]);
           if (!finalized) {
