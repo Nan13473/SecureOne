@@ -49,6 +49,8 @@ export async function verifyMerkleProof(leaf: string, proof: MerkleProof, root: 
 }
 
 async function sha256(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  const webCrypto = globalThis.crypto;
+  if (!webCrypto?.subtle) throw new Error("Web Crypto is unavailable. Open VeriBind through localhost or HTTPS.");
+  const digest = await webCrypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }

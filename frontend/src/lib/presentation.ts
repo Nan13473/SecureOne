@@ -4,6 +4,7 @@ import { hashField, verifyMerkleProof, type MerkleProof } from "./merkle";
 export type Disclosure = {
   fieldName: string;
   fieldValue: string;
+  fieldHash: string;
   fieldIndex: number;
   merkleProof: MerkleProof;
 };
@@ -22,7 +23,22 @@ export type VeribindPresentation = {
   issuedAt: number;
   expiresAt: number;
   nonce: string;
+  signedHash: string;
   holderSignature: string;
+  verificationChallenge?: VerificationChallenge;
+  challengeSignature?: string;
+};
+
+export type VerificationChallenge = {
+  challenge: string;
+  chainId: number;
+  contractAddress: string;
+  tokenId: string;
+  recipientAddress: string;
+  certificateMerkleRoot: string;
+  requestedFields: string[];
+  issuedAt: number;
+  expiresAt: number;
 };
 
 export type PresentationCheck = {
@@ -38,12 +54,15 @@ export type OnChainPresentationContext = {
   tokenId: string;
   status: "Pending" | "Confirmed" | "Disputed";
   certificateMerkleRoot: string;
+  photoHash?: string;
   issuanceDigest: string;
   issuedAt: number;
   expiresAt: number;
 };
 
-export function canonicalPresentationPayload(presentation: Omit<VeribindPresentation, "holderSignature">): string {
+type UnsignedPresentation = Omit<VeribindPresentation, "holderSignature" | "signedHash">;
+
+export function canonicalPresentationPayload(presentation: UnsignedPresentation): string {
   return JSON.stringify({
     type: presentation.type,
     version: presentation.version,
@@ -58,20 +77,56 @@ export function canonicalPresentationPayload(presentation: Omit<VeribindPresenta
     issuedAt: presentation.issuedAt,
     expiresAt: presentation.expiresAt,
     nonce: presentation.nonce,
+    verificationChallenge: presentation.verificationChallenge ?? null,
   });
 }
 
-export function presentationDigest(presentation: Omit<VeribindPresentation, "holderSignature">): string {
+export function presentationDigest(presentation: UnsignedPresentation): string {
   return keccak256(toUtf8Bytes(`veribind-presentation-v1|${canonicalPresentationPayload(presentation)}`));
 }
 
 export async function signPresentation(
   provider: BrowserProvider,
-  payload: Omit<VeribindPresentation, "holderSignature">,
+  payload: UnsignedPresentation,
 ): Promise<VeribindPresentation> {
   const signer = await provider.getSigner();
-  const signature = await signer.signMessage(getBytes(presentationDigest(payload)));
-  return { ...payload, holderSignature: signature };
+  const signedHash = presentationDigest(payload);
+  const signature = await signer.signMessage(getBytes(signedHash));
+  return { ...payload, signedHash, holderSignature: signature };
+}
+
+export function canonicalChallengePayload(challenge: VerificationChallenge): string {
+  return JSON.stringify({
+    type: "veribind-wallet-challenge",
+    version: 1,
+    challenge: challenge.challenge,
+    chainId: challenge.chainId,
+    contractAddress: challenge.contractAddress.toLowerCase(),
+    tokenId: challenge.tokenId,
+    recipientAddress: challenge.recipientAddress.toLowerCase(),
+    certificateMerkleRoot: challenge.certificateMerkleRoot,
+    requestedFields: challenge.requestedFields,
+    issuedAt: challenge.issuedAt,
+    expiresAt: challenge.expiresAt,
+  });
+}
+
+export function challengeDigest(challenge: VerificationChallenge): string {
+  return keccak256(toUtf8Bytes(`veribind-wallet-challenge-v1|${canonicalChallengePayload(challenge)}`));
+}
+
+export async function signVerificationChallenge(provider: BrowserProvider, challenge: VerificationChallenge): Promise<string> {
+  return (await provider.getSigner()).signMessage(getBytes(challengeDigest(challenge)));
+}
+
+export function checkVerificationChallenge(presentation: VeribindPresentation, challenge: VerificationChallenge): PresentationCheck {
+  const signedChallenge = presentation.verificationChallenge;
+  if (!signedChallenge || !presentation.challengeSignature) return { valid: false, reason: "Fresh wallet challenge signature is missing" };
+  if (canonicalChallengePayload(signedChallenge) !== canonicalChallengePayload(challenge)) return { valid: false, reason: "Wallet challenge does not match this verification session" };
+  if (challenge.expiresAt < Math.floor(Date.now() / 1000)) return { valid: false, reason: "Wallet challenge expired" };
+  const recoveredSigner = verifyMessage(getBytes(challengeDigest(challenge)), presentation.challengeSignature);
+  if (recoveredSigner.toLowerCase() !== challenge.recipientAddress.toLowerCase()) return { valid: false, reason: "Invalid fresh wallet challenge signature", recoveredSigner };
+  return { valid: true, recoveredSigner };
 }
 
 export async function checkPresentation(
@@ -88,13 +143,18 @@ export async function checkPresentation(
   if (presentation.issuanceDigest !== chain.issuanceDigest) return { valid: false, reason: "Issuance digest mismatch" };
   if (presentation.expiresAt > 0 && presentation.expiresAt < Math.floor(Date.now() / 1000)) return { valid: false, reason: "Presentation expired" };
 
-  const unsigned = { ...presentation };
-  delete (unsigned as Partial<VeribindPresentation>).holderSignature;
-  const recoveredSigner = verifyMessage(getBytes(presentationDigest(unsigned)), presentation.holderSignature);
+  const { holderSignature, signedHash, ...unsigned } = presentation;
+  const expectedSignedHash = presentationDigest(unsigned);
+  if (signedHash !== expectedSignedHash) return { valid: false, reason: "Signed hash does not match presentation data" };
+  const recoveredSigner = verifyMessage(getBytes(expectedSignedHash), holderSignature);
   if (recoveredSigner.toLowerCase() !== presentation.recipientAddress.toLowerCase()) return { valid: false, reason: "Invalid holder signature", recoveredSigner };
 
   for (const disclosure of presentation.disclosures) {
+    if (disclosure.fieldName.toLowerCase() === "photo hash" && chain.photoHash && disclosure.fieldValue.toLowerCase() !== chain.photoHash.toLowerCase()) {
+      return { valid: false, reason: "Photo commitment mismatch", recoveredSigner };
+    }
     const leaf = await hashField(1, disclosure.fieldName, disclosure.fieldValue);
+    if (disclosure.fieldHash !== leaf) return { valid: false, reason: `Field hash mismatch for ${disclosure.fieldName}`, recoveredSigner };
     const proofOk = await verifyMerkleProof(leaf, disclosure.merkleProof, chain.certificateMerkleRoot);
     if (!proofOk) return { valid: false, reason: `Merkle proof failed for ${disclosure.fieldName}`, recoveredSigner };
   }
@@ -102,6 +162,8 @@ export async function checkPresentation(
 }
 
 export function randomNonce(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const webCrypto = globalThis.crypto;
+  if (!webCrypto?.getRandomValues) throw new Error("Web Crypto is unavailable. Open VeriBind through localhost or HTTPS.");
+  const bytes = webCrypto.getRandomValues(new Uint8Array(16));
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }

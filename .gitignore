@@ -13,3 +13,4 @@ frontend/dist/
 
 .env
 frontend/.env
+frontend/.env.local
