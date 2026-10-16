@@ -267,15 +267,15 @@ function App() {
         const contract = new Contract(contractAddress, identityRegistryAbi, provider);
         const latestBlock = await provider.getBlockNumber();
         const configuredDeploymentBlock = Number(import.meta.env.VITE_VERIBIND_DEPLOYMENT_BLOCK || 0);
-        const maxLogRange = 2_000;
+        const maxLogRange = 100;
         const configuredFromBlock = configuredDeploymentBlock > 0
           ? configuredDeploymentBlock
           : latestBlock - maxLogRange;
         const fromBlock = Math.max(0, Math.max(configuredFromBlock, latestBlock - maxLogRange));
         const events = [];
         const filter = contract.filters.IssuanceProposed(null, selectedHolderAddress);
-        for (let chunkStart = fromBlock; chunkStart <= latestBlock; chunkStart += 500) {
-          const chunkEnd = Math.min(latestBlock, chunkStart + 499);
+        for (let chunkStart = fromBlock; chunkStart <= latestBlock; chunkStart += 10) {
+          const chunkEnd = Math.min(latestBlock, chunkStart + 9);
           events.push(...await contract.queryFilter(filter, chunkStart, chunkEnd));
         }
         const threshold = Number(await contract.APPROVAL_THRESHOLD());
