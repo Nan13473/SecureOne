@@ -401,8 +401,8 @@ of the current ABI.
 
 `VITE_VERIBIND_DEPLOYMENT_BLOCK` is optional and should be set to the block
 where the configured contract was deployed. If it is left at `0`, the issuer
-approval lookup scans only the latest 10,000 blocks to stay within public RPC
-log-query limits.
+approval lookup scans only the latest 2,000 blocks to stay within stricter
+public RPC log-query limits.
 
 Deployment-only values such as `SEPOLIA_RPC_URL`, `DEPLOYER_PRIVATE_KEY`, and
 `PINATA_JWT` belong in `.env` and must never be committed.
