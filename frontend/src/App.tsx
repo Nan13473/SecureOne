@@ -267,9 +267,11 @@ function App() {
         const contract = new Contract(contractAddress, identityRegistryAbi, provider);
         const latestBlock = await provider.getBlockNumber();
         const configuredDeploymentBlock = Number(import.meta.env.VITE_VERIBIND_DEPLOYMENT_BLOCK || 0);
-        const fromBlock = configuredDeploymentBlock > 0
+        const maxLogRange = 10_000;
+        const configuredFromBlock = configuredDeploymentBlock > 0
           ? configuredDeploymentBlock
-          : Math.max(0, latestBlock - 10_000);
+          : latestBlock - maxLogRange;
+        const fromBlock = Math.max(0, Math.max(configuredFromBlock, latestBlock - maxLogRange));
         const events = await contract.queryFilter(
           contract.filters.IssuanceProposed(null, selectedHolderAddress),
           fromBlock,
